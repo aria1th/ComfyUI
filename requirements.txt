@@ -1,4 +1,6 @@
-torch
+torch --index-url https://download.pytorch.org/whl/cu121
+torchvision --index-url https://download.pytorch.org/whl/cu121
+torchaudio --index-url https://download.pytorch.org/whl/cu121
 torchsde
 einops
 transformers>=4.25.1
