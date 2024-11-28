@@ -139,6 +139,16 @@ parser.add_argument("--disable-all-custom-nodes", action="store_true", help="Dis
 parser.add_argument("--multi-user", action="store_true", help="Enables per-user storage.")
 
 parser.add_argument("--verbose", default='INFO', const='DEBUG', nargs="?", choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'], help='Set the logging level')
+# WebServer args
+# authorization_header files
+parser.add_argument("--authorization-header", type=str, default=None, help="Set the authorization header.")
+parser.add_argument("--authorization-header-file", type=str, default=None, help="Path to the authorization header file.")
+# logging result path
+parser.add_argument("--logging-result-path", type=str, default=None, help="Path to the logging result file.")
+# allow-origins
+parser.add_argument("--allow-origins-file", type=str, default=None, help="Set the CORS allow origins from file.")
+# exclude-localhost-auth
+parser.add_argument("--exclude-localhost-auth", action="store_true", help="Exclude localhost from authorization.")
 
 # The default built-in provider hosted under web/
 DEFAULT_VERSION_STRING = "comfyanonymous/ComfyUI@latest"
