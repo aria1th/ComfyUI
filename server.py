@@ -32,16 +32,25 @@ from app.user_manager import UserManager
 from typing import Optional
 from api_server.routes.internal.internal_routes import InternalRoutes
 
+api_logger = logging.getLogger("api_logger")
 def setup_logging(args):
     if args.logging_result_path:
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-            handlers=[
-                logging.FileHandler(args.logging_result_path),
-                logging.StreamHandler()
-            ]
-        )
+        # Set the logging level
+        api_logger.setLevel(logging.INFO)
+
+        # Create a file handler
+        file_handler = logging.FileHandler(args.logging_result_path)
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+
+        # Create a stream handler
+        stream_handler = logging.StreamHandler()
+        stream_handler.setLevel(logging.INFO)
+        stream_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+
+        # Add the handlers to the logger
+        api_logger.addHandler(file_handler)
+        api_logger.addHandler(stream_handler)
 
 
 class BinaryEventTypes:
@@ -104,7 +113,7 @@ def validate_cors_origin(client_ip):
             try:
                 allowed.append(ipaddress.ip_address(ip))
             except ValueError:
-                logging.warning(f'Invalid IP address or network: {ip}')
+                api_logger.warning(f'Invalid IP address or network: {ip}')
     for ip in allowed:
         # compare the client IP to the allowed IPs
         if ipaddress.ip_address(client_ip) in ip:
@@ -112,7 +121,7 @@ def validate_cors_origin(client_ip):
         # if the client IP is a loopback address, allow it
         if ipaddress.ip_address(client_ip).is_loopback:
             return True
-    logging.warning(f'Unauthorized access attempt from {client_ip}')
+    api_logger.warning(f'Unauthorized access attempt from {client_ip}')
     return False
 
 def skip_localhost_check(client_ip):
@@ -134,7 +143,7 @@ def create_auth_middleware():
             if not auth_header or not validate_auth_header(auth_header):
                 # Log the unauthorized access attempt
                 requested_path = request.path
-                logging.warning(f'Authorization failure: Unauthorized access attempt from {source_ip} to {requested_path}')
+                api_logger.warning(f'Authorization failure: Unauthorized access attempt from {source_ip} to {requested_path}')
                 return web.Response(status=401, text='Unauthorized')
         return await handler(request)
     return auth_middleware
@@ -207,6 +216,7 @@ def create_origin_only_middleware():
             if loopback and host_domain is not None and origin_domain is not None and len(host_domain) > 0 and len(origin_domain) > 0:
                 if host_domain != origin_domain:
                     logging.warning("WARNING: request with non matching host and origin {} != {}, returning 403".format(host_domain, origin_domain))
+                    api_logger.warning(f'Unauthorized access with mismatching origin attempt from {get_client_ip(request)}')
                     return web.Response(status=403)
 
         if request.method == "OPTIONS":
