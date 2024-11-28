@@ -32,6 +32,18 @@ from app.user_manager import UserManager
 from typing import Optional
 from api_server.routes.internal.internal_routes import InternalRoutes
 
+def setup_logging(args):
+    if args.logging_result_path:
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler(args.logging_result_path),
+                logging.StreamHandler()
+            ]
+        )
+
+
 class BinaryEventTypes:
     PREVIEW_IMAGE = 1
     UNENCODED_PREVIEW_IMAGE = 2
@@ -63,6 +75,69 @@ async def cache_control(request: web.Request, handler):
     if request.path.endswith('.js') or request.path.endswith('.css'):
         response.headers.setdefault('Cache-Control', 'no-cache')
     return response
+
+def validate_auth_header(auth_header):
+    token_file = args.authorization_header_file
+    if not token_file or not os.path.exists(token_file):
+        return True
+    with open(token_file, 'r', encoding='utf-8') as f:
+        allowed_tokens = f.read().splitlines()
+    if args.authorization_header:
+        allowed_tokens.append(args.authorization_header)
+    for expected_token in allowed_tokens:
+        if auth_header == f'Bearer {expected_token}':
+            return True
+    return False
+
+def validate_cors_origin(client_ip):
+    origin_ips_file = args.allow_origins_file
+    if not origin_ips_file or not os.path.exists(origin_ips_file):
+        return True
+    # ips can be specified in the file in CIDR notation or as a single IP
+    with open(origin_ips_file, 'r', encoding='utf-8') as f:
+        allowed_ips = f.read().splitlines()
+    allowed = []
+    for ip in allowed_ips:
+        try:
+            allowed.append(ipaddress.ip_network(ip))
+        except ValueError:
+            try:
+                allowed.append(ipaddress.ip_address(ip))
+            except ValueError:
+                logging.warning(f'Invalid IP address or network: {ip}')
+    for ip in allowed:
+        # compare the client IP to the allowed IPs
+        if ipaddress.ip_address(client_ip) in ip:
+            return True
+        # if the client IP is a loopback address, allow it
+        if ipaddress.ip_address(client_ip).is_loopback:
+            return True
+    logging.warning(f'Unauthorized access attempt from {client_ip}')
+    return False
+
+def skip_localhost_check(client_ip):
+    # if the client IP is a loopback address and the flag is set, allow it
+    if args.exclude_localhost_auth and ipaddress.ip_address(client_ip).is_loopback:
+        return True
+    return False
+
+def create_auth_middleware():
+    @web.middleware
+    async def auth_middleware(request, handler):
+        if args.authorization_header_file is None:
+            return await handler(request)
+        source_ip = get_client_ip(request)
+        if not skip_localhost_check(source_ip):
+            auth_header = request.headers.get('Authorization')
+            if not validate_cors_origin(source_ip):
+                return web.Response(status=403, text='Forbidden')
+            if not auth_header or not validate_auth_header(auth_header):
+                # Log the unauthorized access attempt
+                requested_path = request.path
+                logging.warning(f'Authorization failure: Unauthorized access attempt from {source_ip} to {requested_path}')
+                return web.Response(status=401, text='Unauthorized')
+        return await handler(request)
+    return auth_middleware
 
 def create_cors_middleware(allowed_origin: str):
     @web.middleware
@@ -143,8 +218,19 @@ def create_origin_only_middleware():
 
     return origin_only_middleware
 
+def get_client_ip(request):
+    # Check if the 'X-Forwarded-For' header is present (if behind a reverse proxy)
+    forwarded_for = request.headers.get('X-Forwarded-For')
+    if forwarded_for:
+        # Extract the first IP in the list
+        ip = forwarded_for.split(',')[0].strip()
+    else:
+        ip = request.remote
+    return ip
+
 class PromptServer():
     def __init__(self, loop):
+        setup_logging(args)
         PromptServer.instance = self
 
         mimetypes.init()
@@ -164,7 +250,8 @@ class PromptServer():
             middlewares.append(create_cors_middleware(args.enable_cors_header))
         else:
             middlewares.append(create_origin_only_middleware())
-
+        auth_middleware = create_auth_middleware()
+        middlewares.append(auth_middleware)
         max_upload_size = round(args.max_upload_size * 1024 * 1024)
         self.app = web.Application(client_max_size=max_upload_size, middlewares=middlewares)
         self.sockets = dict()
