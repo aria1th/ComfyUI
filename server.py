@@ -229,13 +229,29 @@ def create_origin_only_middleware():
     return origin_only_middleware
 
 def get_client_ip(request):
-    # Check if the 'X-Forwarded-For' header is present (if behind a reverse proxy)
+    """
+    Extracts the client IP address from the request, considering scenarios where the server is behind a reverse proxy.
+    Falls back to request.remote if X-Forwarded-For is unavailable or untrustworthy.
+    """
     forwarded_for = request.headers.get('X-Forwarded-For')
+    ip = None
     if forwarded_for:
         # Extract the first IP in the list
         ip = forwarded_for.split(',')[0].strip()
-    else:
+        try:
+            parsed_ip = ipaddress.ip_address(ip)
+            # Reject loopback or private IP addresses from the forwarded header
+            if parsed_ip.is_loopback or parsed_ip.is_private:
+                api_logger.warning(f'Untrusted forwarded IP address: {ip} in request from {request.remote}, please ensure the proxy is configured correctly.')
+                raise ValueError("Untrusted forwarded IP address.")
+        except ValueError:
+            # Log or handle the untrusted/invalid IP scenario
+            ip = None
+    
+    # Fallback to request.remote
+    if not ip:
         ip = request.remote
+
     return ip
 
 class PromptServer():
