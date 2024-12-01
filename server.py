@@ -574,6 +574,130 @@ class PromptServer():
                         return web.FileResponse(file, headers={"Content-Disposition": f"filename=\"{filename}\""})
 
             return web.Response(status=404)
+        async def view_image_parsed(filename=None, output_type='output', subfolder=None, preview=None, channel='rgba', remove_after=False):
+            if not filename:
+                return None
+
+            filename, output_dir = folder_paths.annotated_filepath(filename)
+
+            # Validation for security: prevent accessing arbitrary paths
+            if filename.startswith('/') or '..' in filename:
+                return None
+
+            if output_dir is None:
+                output_dir = folder_paths.get_directory_by_type(output_type)
+
+            if output_dir is None:
+                return None
+
+            if subfolder:
+                full_output_dir = os.path.join(output_dir, subfolder)
+                if os.path.commonpath((os.path.abspath(full_output_dir), output_dir)) != output_dir:
+                    return None
+                output_dir = full_output_dir
+
+            filename = os.path.basename(filename)
+            file_path = os.path.join(output_dir, filename)
+
+            if os.path.isfile(file_path):
+                content = None
+                content_type = None
+
+                if preview:
+                    with Image.open(file_path) as img:
+                        preview_info = preview.split(';')
+                        image_format = preview_info[0]
+                        if image_format not in ['webp', 'jpeg'] or 'a' in channel:
+                            image_format = 'webp'
+
+                        quality = 90
+                        if preview_info[-1].isdigit():
+                            quality = int(preview_info[-1])
+
+                        buffer = BytesIO()
+                        if image_format == 'jpeg' or channel == 'rgb':
+                            img = img.convert("RGB")
+                        img.save(buffer, format=image_format, quality=quality)
+                        buffer.seek(0)
+                        content = buffer.read()
+                        content_type = f'image/{image_format}'
+
+                elif channel in ['rgb', 'a']:
+                    with Image.open(file_path) as img:
+                        if channel == 'rgb':
+                            if img.mode == "RGBA":
+                                r, g, b, _ = img.split()
+                                new_img = Image.merge('RGB', (r, g, b))
+                            else:
+                                new_img = img.convert("RGB")
+                        elif channel == 'a':
+                            if img.mode == "RGBA":
+                                _, _, _, a = img.split()
+                            else:
+                                a = Image.new('L', img.size, 255)
+                            new_img = Image.new('RGBA', img.size)
+                            new_img.putalpha(a)
+
+                        buffer = BytesIO()
+                        new_img.save(buffer, format='PNG')
+                        buffer.seek(0)
+                        content = buffer.read()
+                        content_type = 'image/png'
+
+                else:
+                    # Read the file content directly
+                    with open(file_path, 'rb') as f:
+                        content = f.read()
+                    content_type = 'application/octet-stream'
+
+                if remove_after:
+                    try:
+                        os.remove(file_path)
+                    except Exception as e:
+                        logging.error(f"Error deleting file: {e}")
+
+                return {
+                    'filename': filename,
+                    'content': content,
+                    'content_type': content_type,
+                }
+
+            return None
+
+        async def _file_response_with_cleanup(request, file_path, filename):
+            """
+            Helper function to send a file and delete it after the response is sent.
+            """
+            response = web.StreamResponse(
+                status=200,
+                reason='OK',
+                headers={"Content-Disposition": f'filename="{filename}"'}
+            )
+            response.content_type = 'application/octet-stream'
+
+            # Open the file in binary mode
+            file_size = os.path.getsize(file_path)
+            response.content_length = file_size
+
+            await response.prepare(request)
+
+            try:
+                with open(file_path, 'rb') as f:
+                    chunk_size = 64 * 1024  # 64KB
+                    while True:
+                        chunk = f.read(chunk_size)
+                        if not chunk:
+                            break
+                        await response.write(chunk)
+            finally:
+                # Delete the file after sending
+                try:
+                    os.remove(file_path)
+                except Exception as e:
+                    logging.error(f"Error deleting file: {e}")
+
+            await response.write_eof()
+            return response
 
         @routes.get("/view_metadata/{folder_name}")
         async def view_metadata(request):
@@ -709,6 +833,8 @@ class PromptServer():
 
         @routes.post("/prompt")
         async def post_prompt(request):
+            request: web.Request = request
+            
             logging.info("got prompt")
             resp_code = 200
             out_string = ""
@@ -745,7 +871,91 @@ class PromptServer():
                     return web.json_response({"error": valid[1], "node_errors": valid[3]}, status=400)
             else:
                 return web.json_response({"error": "no prompt", "node_errors": []}, status=400)
+        @routes.post("/prompt_sync")
+        async def post_prompt(request):
+            request: web.Request = request
+            
+            logging.info("got prompt")
+            resp_code = 200
+            out_string = ""
+            json_data =  await request.json()
+            json_data = self.trigger_on_prompt(json_data)
 
+            if "number" in json_data:
+                number = float(json_data['number'])
+            else:
+                number = self.number
+                if "front" in json_data:
+                    if json_data['front']:
+                        number = -number
+
+                self.number += 1
+
+            if "prompt" in json_data:
+                prompt = json_data["prompt"]
+                valid = execution.validate_prompt(prompt)
+                extra_data = {}
+                if "extra_data" in json_data:
+                    extra_data = json_data["extra_data"]
+
+                if "client_id" in json_data:
+                    extra_data["client_id"] = json_data["client_id"]
+                if valid[0]:
+                    prompt_id = str(uuid.uuid4())
+                    outputs_to_execute = valid[2]
+                    self.prompt_queue.put((number, prompt_id, prompt, extra_data, outputs_to_execute))
+                    # wait for the prompt to finish
+                    while self.prompt_queue.get_tasks_remaining() > 0:
+                        await asyncio.sleep(0.1)
+                    result_history = self.prompt_queue.get_history(prompt_id=prompt_id)
+                    outputs = result_history.get(prompt_id, {}).get("outputs", {})
+                    files_to_view = []
+                    for output in outputs.values():
+                        if "images" in output:
+                            for image in output["images"]:
+                                if "filename" in image:
+                                    files_to_view.append({
+                                        'filename': image['filename'],
+                                        'output_type': image.get('type', 'output'),
+                                        'subfolder': image.get('subfolder'),
+                                        # 'preview' and 'channel' can be added if available
+                                    })
+                    response_files_data = []
+                    for file_info in files_to_view:
+                        image_info = await view_image_parsed(
+                            filename=file_info['filename'],
+                            output_type=file_info.get('output_type', 'output'),
+                            subfolder=file_info.get('subfolder'),
+                            preview=None,  # or set this if needed
+                            channel='rgba',  # or set this if needed
+                            remove_after=True
+                        )
+                        if image_info is not None:
+                            # Encode the image data in base64
+                            import base64
+                            encoded_image = base64.b64encode(image_info['content']).decode('utf-8')
+                            response_files_data.append({
+                                'filename': image_info['filename'],
+                                'image_data': encoded_image,
+                                'content_type': image_info['content_type'],
+                            })
+                        else:
+                            # Handle the case where the image could not be read
+                            logging.error(f"Failed to process image: {file_info['filename']}")
+
+                    response = {
+                        "prompt_id": prompt_id,
+                        "number": number,
+                        "node_errors": valid[3],
+                        "images": response_files_data
+                    }
+                    return web.json_response(response)
+
+                else:
+                    logging.warning("invalid prompt: {}".format(valid[1]))
+                    return web.json_response({"error": valid[1], "node_errors": valid[3]}, status=400)
+            else:
+                return web.json_response({"error": "no prompt", "node_errors": []}, status=400)
         @routes.post("/queue")
         async def post_queue(request):
             json_data =  await request.json()
