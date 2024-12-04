@@ -576,23 +576,35 @@ class PromptServer():
             return web.Response(status=404)
         async def view_image_parsed(filename=None, output_type='output', subfolder=None, preview=None, channel='rgba', remove_after=False):
             if not filename:
+                logging.warning("No filename provided")
                 return None
 
             filename, output_dir = folder_paths.annotated_filepath(filename)
-
             # Validation for security: prevent accessing arbitrary paths
-            if filename.startswith('/') or '..' in filename:
+            if filename.startswith('/'):
+                # check if explicitly allowed directory
+                possible_root_dir = folder_paths.get_output_directory()
+                # check if the filename is in the output directory
+                if os.path.commonpath((os.path.abspath(filename), possible_root_dir)) != possible_root_dir:
+                    logging.warning(f"Invalid filename: {filename}")
+                    return None
+            if '..' in filename:
+                # always disallow parent directory access
+                logging.warning(f"Invalid filename: {filename}")
+                logging.error(f"Atempted to access parent directory : {filename}")
                 return None
 
             if output_dir is None:
                 output_dir = folder_paths.get_directory_by_type(output_type)
 
             if output_dir is None:
+                logging.warning(f"Invalid output type: {output_type} caused no output directory")
                 return None
 
             if subfolder:
                 full_output_dir = os.path.join(output_dir, subfolder)
                 if os.path.commonpath((os.path.abspath(full_output_dir), output_dir)) != output_dir:
+                    logging.warning(f"Invalid subfolder: {subfolder}")
                     return None
                 output_dir = full_output_dir
 
@@ -661,7 +673,7 @@ class PromptServer():
                     'content': content,
                     'content_type': content_type,
                 }
-
+            logging.warning(f"File not found: {file_path}")
             return None
 
         async def _file_response_with_cleanup(request, file_path, filename):
