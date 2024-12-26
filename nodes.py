@@ -620,9 +620,11 @@ class LoraLoader:
             "required": { 
                 "model": ("MODEL", {"tooltip": "The diffusion model the LoRA will be applied to."}),
                 "clip": ("CLIP", {"tooltip": "The CLIP model the LoRA will be applied to."}),
-                "lora_name": (folder_paths.get_filename_list("loras"), {"tooltip": "The name of the LoRA."}),
+                "lora_name": ("STRING", {"tooltip": "The name of the LoRA to load."}),
                 "strength_model": ("FLOAT", {"default": 1.0, "min": -100.0, "max": 100.0, "step": 0.01, "tooltip": "How strongly to modify the diffusion model. This value can be negative."}),
                 "strength_clip": ("FLOAT", {"default": 1.0, "min": -100.0, "max": 100.0, "step": 0.01, "tooltip": "How strongly to modify the CLIP model. This value can be negative."}),
+                "bucket_name": ("STRING", {"default": "", "tooltip": "The name of the bucket where the LoRA is stored."}),
+                "object_key": ("STRING", {"default": "", "tooltip": "The object key for the LoRA."}),
             }
         }
     
@@ -633,11 +635,11 @@ class LoraLoader:
     CATEGORY = "loaders"
     DESCRIPTION = "LoRAs are used to modify diffusion and CLIP models, altering the way in which latents are denoised such as applying styles. Multiple LoRA nodes can be linked together."
 
-    def load_lora(self, model, clip, lora_name, strength_model, strength_clip):
+    def load_lora(self, model, clip, lora_name, strength_model, strength_clip, bucket_name, object_key):
         if strength_model == 0 and strength_clip == 0:
             return (model, clip)
 
-        lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
+        lora_path = folder_paths.get_lora_full_path_or_raise("loras", lora_name, bucket_name, object_key)
         lora = None
         if self.loaded_lora is not None:
             if self.loaded_lora[0] == lora_path:
