@@ -4,8 +4,25 @@ import os
 import time
 import mimetypes
 import logging
+import boto3
 from typing import Set, List, Dict, Tuple, Literal
 from collections.abc import Collection
+from dotenv import load_dotenv
+from boto3.s3.transfer import TransferConfig
+import sys
+
+load_dotenv()
+
+AWS_ACCESS_KEY_ID = os.getenv('AWS_ACCESS_KEY_ID')
+AWS_SECRET_ACCESS_KEY = os.getenv('AWS_SECRET_ACCESS_KEY')
+AWS_DEFAULT_REGION = os.getenv('AWS_DEFAULT_REGION')
+
+s3_client = boto3.client(
+    's3',
+    aws_access_key_id=AWS_ACCESS_KEY_ID,
+    aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+    region_name=AWS_DEFAULT_REGION
+)
 
 supported_pt_extensions: set[str] = {'.ckpt', '.pt', '.bin', '.pth', '.safetensors', '.pkl', '.sft'}
 
@@ -45,6 +62,23 @@ input_directory = os.path.join(os.path.dirname(os.path.realpath(__file__)), "inp
 user_directory = os.path.join(os.path.dirname(os.path.realpath(__file__)), "user")
 
 filename_list_cache: dict[str, tuple[list[str], dict[str, float], float]] = {}
+
+class ProgressPercentage:
+    def __init__(self, file_size):
+        self._file_size = file_size
+        self._seen_so_far = 0
+        self._start_time = time.time()
+
+    def __call__(self, bytes_amount):
+        self._seen_so_far += bytes_amount
+        elapsed_time = time.time() - self._start_time
+        percentage = (self._seen_so_far / self._file_size) * 100
+        speed = self._seen_so_far / elapsed_time if elapsed_time > 0 else 0
+        sys.stdout.write(
+            f"\rDownloading... {self._seen_so_far}/{self._file_size} bytes "
+            f"({percentage:.2f}%) | Speed: {speed:.2f} bytes/s | Elapsed: {elapsed_time:.2f}s"
+        )
+        sys.stdout.flush()
 
 class CacheHelper:
     """
@@ -278,6 +312,43 @@ def get_full_path_or_raise(folder_name: str, filename: str) -> str:
     full_path = get_full_path(folder_name, filename)
     if full_path is None:
         raise FileNotFoundError(f"Model in folder '{folder_name}' with filename '{filename}' not found.")
+    return full_path
+
+def get_lora_from_s3(bucket_name: str, object_key: str, save_path: str) -> bool:
+    try:
+        logging.info(f"Fetching LoRA from S3: {bucket_name}/{object_key} to {save_path}")
+
+        response = s3_client.head_object(Bucket=bucket_name, Key=object_key)
+        file_size = response['ContentLength']
+        config = TransferConfig(multipart_threshold=1024 * 25, max_concurrency=10, multipart_chunksize=1024 * 25)
+        start_time = time.time()
+        s3_client.download_file(
+            bucket_name, object_key, save_path,
+            Config=config,
+            Callback=ProgressPercentage(file_size)
+        )
+        elapsed_time = time.time() - start_time
+        logging.info(f"Successfully saved LoRA file to {save_path} in {elapsed_time:.2f} seconds.")
+        return True
+    except Exception as e:
+        logging.error(f"Error fetching LoRA from S3: {e}")
+        return False
+
+def get_lora_full_path_or_raise(folder_name: str, filename: str, bucket_name: str, object_key: str) -> str: 
+    full_path = get_full_path(folder_name, filename)
+    if full_path is None:
+        global folder_names_and_paths
+        folder_name = map_legacy(folder_name)
+        if folder_name not in folder_names_and_paths:
+            raise FileNotFoundError(f"Folder '{folder_name}' not found in folder_names_and_paths.")
+
+        folders = folder_names_and_paths[folder_name]
+        save_path = os.path.join(folders[0][0], filename)
+        if not get_lora_from_s3(bucket_name, object_key, save_path):
+            raise FileNotFoundError(f"Failed to fetch LoRA from S3: {bucket_name}/{object_key}")
+
+        return save_path
+
     return full_path
 
 
