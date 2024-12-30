@@ -8,7 +8,7 @@ import os
 # Set up logging
 logger = logging.getLogger("Balancer")
 logger.setLevel(logging.INFO)
-handler = logging.FileHandler("./app.log")  # Specify your log file path
+handler = logging.FileHandler("./balancer.log")  # Specify your log file path
 formatter = logging.Formatter(
     '%(asctime)s - %(levelname)s - %(clientip)s - "%(request_line)s" %(status_code)s'
 )
@@ -41,7 +41,7 @@ async def log_requests(request: Request, call_next):
     return response
 
 TIMEOUT_SECONDS = 600
-MAX_REQUEST_SIZE = 1024 * 1024  # Limit request size to 1MB
+MAX_REQUEST_SIZE = 30 * 1024 * 1024  # Limit request size to 30MB
 
 worker_endpoints_str = os.getenv("WORKER_ENDPOINTS", "http://comfyui-worker:9200/prompt_sync")
 WORKER_ENDPOINTS = [endpoint.strip() for endpoint in worker_endpoints_str.split(",") if endpoint.strip()]
