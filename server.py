@@ -35,6 +35,27 @@ from app.custom_node_manager import CustomNodeManager
 from typing import Optional
 from api_server.routes.internal.internal_routes import InternalRoutes
 
+api_logger = logging.getLogger("api_logger")
+def setup_logging(args):
+    if args.logging_result_path:
+        # Set the logging level
+        api_logger.setLevel(logging.INFO)
+
+        # Create a file handler
+        file_handler = logging.FileHandler(args.logging_result_path)
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+
+        # Create a stream handler
+        stream_handler = logging.StreamHandler()
+        stream_handler.setLevel(logging.INFO)
+        stream_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+
+        # Add the handlers to the logger
+        api_logger.addHandler(file_handler)
+        api_logger.addHandler(stream_handler)
+
+
 class BinaryEventTypes:
     PREVIEW_IMAGE = 1
     UNENCODED_PREVIEW_IMAGE = 2
@@ -51,6 +72,69 @@ async def cache_control(request: web.Request, handler):
     if request.path.endswith('.js') or request.path.endswith('.css'):
         response.headers.setdefault('Cache-Control', 'no-cache')
     return response
+
+def validate_auth_header(auth_header):
+    token_file = args.authorization_header_file
+    if not token_file or not os.path.exists(token_file):
+        return True
+    with open(token_file, 'r', encoding='utf-8') as f:
+        allowed_tokens = f.read().splitlines()
+    if args.authorization_header:
+        allowed_tokens.append(args.authorization_header)
+    for expected_token in allowed_tokens:
+        if auth_header == f'Bearer {expected_token}':
+            return True
+    return False
+
+def validate_cors_origin(client_ip):
+    origin_ips_file = args.allow_origins_file
+    if not origin_ips_file or not os.path.exists(origin_ips_file):
+        return True
+    # ips can be specified in the file in CIDR notation or as a single IP
+    with open(origin_ips_file, 'r', encoding='utf-8') as f:
+        allowed_ips = f.read().splitlines()
+    allowed = []
+    for ip in allowed_ips:
+        try:
+            allowed.append(ipaddress.ip_network(ip))
+        except ValueError:
+            try:
+                allowed.append(ipaddress.ip_address(ip))
+            except ValueError:
+                api_logger.warning(f'Invalid IP address or network: {ip}')
+    for ip in allowed:
+        # compare the client IP to the allowed IPs
+        if ipaddress.ip_address(client_ip) in ip:
+            return True
+        # if the client IP is a loopback address, allow it
+        if ipaddress.ip_address(client_ip).is_loopback:
+            return True
+    api_logger.warning(f'Unauthorized access attempt from {client_ip}')
+    return False
+
+def skip_localhost_check(client_ip):
+    # if the client IP is a loopback address and the flag is set, allow it
+    if args.exclude_localhost_auth and ipaddress.ip_address(client_ip).is_loopback:
+        return True
+    return False
+
+def create_auth_middleware():
+    @web.middleware
+    async def auth_middleware(request, handler):
+        if args.authorization_header_file is None:
+            return await handler(request)
+        source_ip = get_client_ip(request)
+        if not skip_localhost_check(source_ip):
+            auth_header = request.headers.get('Authorization')
+            if not validate_cors_origin(source_ip):
+                return web.Response(status=403, text='Forbidden')
+            if not auth_header or not validate_auth_header(auth_header):
+                # Log the unauthorized access attempt
+                requested_path = request.path
+                api_logger.warning(f'Authorization failure: Unauthorized access attempt from {source_ip} to {requested_path}')
+                return web.Response(status=401, text='Unauthorized')
+        return await handler(request)
+    return auth_middleware
 
 def create_cors_middleware(allowed_origin: str):
     @web.middleware
@@ -120,6 +204,7 @@ def create_origin_only_middleware():
             if loopback and host_domain is not None and origin_domain is not None and len(host_domain) > 0 and len(origin_domain) > 0:
                 if host_domain != origin_domain:
                     logging.warning("WARNING: request with non matching host and origin {} != {}, returning 403".format(host_domain, origin_domain))
+                    api_logger.warning(f'Unauthorized access with mismatching origin attempt from {get_client_ip(request)}')
                     return web.Response(status=403)
 
         if request.method == "OPTIONS":
@@ -131,8 +216,35 @@ def create_origin_only_middleware():
 
     return origin_only_middleware
 
+def get_client_ip(request):
+    """
+    Extracts the client IP address from the request, considering scenarios where the server is behind a reverse proxy.
+    Falls back to request.remote if X-Forwarded-For is unavailable or untrustworthy.
+    """
+    forwarded_for = request.headers.get('X-Forwarded-For')
+    ip = None
+    if forwarded_for:
+        # Extract the first IP in the list
+        ip = forwarded_for.split(',')[0].strip()
+        try:
+            parsed_ip = ipaddress.ip_address(ip)
+            # Reject loopback or private IP addresses from the forwarded header
+            if parsed_ip.is_loopback or parsed_ip.is_private:
+                api_logger.warning(f'Untrusted forwarded IP address: {ip} in request from {request.remote}, please ensure the proxy is configured correctly.')
+                raise ValueError("Untrusted forwarded IP address.")
+        except ValueError:
+            # Log or handle the untrusted/invalid IP scenario
+            ip = None
+    
+    # Fallback to request.remote
+    if not ip:
+        ip = request.remote
+
+    return ip
+
 class PromptServer():
     def __init__(self, loop):
+        setup_logging(args)
         PromptServer.instance = self
 
         mimetypes.init()
@@ -154,7 +266,8 @@ class PromptServer():
             middlewares.append(create_cors_middleware(args.enable_cors_header))
         else:
             middlewares.append(create_origin_only_middleware())
-
+        auth_middleware = create_auth_middleware()
+        middlewares.append(auth_middleware)
         max_upload_size = round(args.max_upload_size * 1024 * 1024)
         self.app = web.Application(client_max_size=max_upload_size, middlewares=middlewares)
         self.sockets = dict()
@@ -465,6 +578,142 @@ class PromptServer():
                         )
 
             return web.Response(status=404)
+        async def view_image_parsed(filename=None, output_type='output', subfolder=None, preview=None, channel='rgba', remove_after=False):
+            if not filename:
+                logging.warning("No filename provided")
+                return None
+
+            filename, output_dir = folder_paths.annotated_filepath(filename)
+            # Validation for security: prevent accessing arbitrary paths
+            if filename.startswith('/'):
+                # check if explicitly allowed directory
+                possible_root_dir = folder_paths.get_output_directory()
+                # check if the filename is in the output directory
+                if os.path.commonpath((os.path.abspath(filename), possible_root_dir)) != possible_root_dir:
+                    logging.warning(f"Invalid filename: {filename}")
+                    return None
+            if '..' in filename:
+                # always disallow parent directory access
+                logging.warning(f"Invalid filename: {filename}")
+                logging.error(f"Atempted to access parent directory : {filename}")
+                return None
+
+            if output_dir is None:
+                output_dir = folder_paths.get_directory_by_type(output_type)
+
+            if output_dir is None:
+                logging.warning(f"Invalid output type: {output_type} caused no output directory")
+                return None
+
+            if subfolder:
+                full_output_dir = os.path.join(output_dir, subfolder)
+                if os.path.commonpath((os.path.abspath(full_output_dir), output_dir)) != output_dir:
+                    logging.warning(f"Invalid subfolder: {subfolder}")
+                    return None
+                output_dir = full_output_dir
+
+            filename = os.path.basename(filename)
+            file_path = os.path.join(output_dir, filename)
+
+            if os.path.isfile(file_path):
+                content = None
+                content_type = None
+
+                if preview:
+                    with Image.open(file_path) as img:
+                        preview_info = preview.split(';')
+                        image_format = preview_info[0]
+                        if image_format not in ['webp', 'jpeg'] or 'a' in channel:
+                            image_format = 'webp'
+
+                        quality = 90
+                        if preview_info[-1].isdigit():
+                            quality = int(preview_info[-1])
+
+                        buffer = BytesIO()
+                        if image_format == 'jpeg' or channel == 'rgb':
+                            img = img.convert("RGB")
+                        img.save(buffer, format=image_format, quality=quality)
+                        buffer.seek(0)
+                        content = buffer.read()
+                        content_type = f'image/{image_format}'
+
+                elif channel in ['rgb', 'a']:
+                    with Image.open(file_path) as img:
+                        if channel == 'rgb':
+                            if img.mode == "RGBA":
+                                r, g, b, _ = img.split()
+                                new_img = Image.merge('RGB', (r, g, b))
+                            else:
+                                new_img = img.convert("RGB")
+                        elif channel == 'a':
+                            if img.mode == "RGBA":
+                                _, _, _, a = img.split()
+                            else:
+                                a = Image.new('L', img.size, 255)
+                            new_img = Image.new('RGBA', img.size)
+                            new_img.putalpha(a)
+
+                        buffer = BytesIO()
+                        new_img.save(buffer, format='PNG')
+                        buffer.seek(0)
+                        content = buffer.read()
+                        content_type = 'image/png'
+
+                else:
+                    # Read the file content directly
+                    with open(file_path, 'rb') as f:
+                        content = f.read()
+                    content_type = 'application/octet-stream'
+
+                if remove_after:
+                    try:
+                        os.remove(file_path)
+                    except Exception as e:
+                        logging.error(f"Error deleting file: {e}")
+
+                return {
+                    'filename': filename,
+                    'content': content,
+                    'content_type': content_type,
+                }
+            logging.warning(f"File not found: {file_path}")
+            return None
+
+        async def _file_response_with_cleanup(request, file_path, filename):
+            """
+            Helper function to send a file and delete it after the response is sent.
+            """
+            response = web.StreamResponse(
+                status=200,
+                reason='OK',
+                headers={"Content-Disposition": f'filename="{filename}"'}
+            )
+            response.content_type = 'application/octet-stream'
+
+            # Open the file in binary mode
+            file_size = os.path.getsize(file_path)
+            response.content_length = file_size
+
+            await response.prepare(request)
+
+            try:
+                with open(file_path, 'rb') as f:
+                    chunk_size = 64 * 1024  # 64KB
+                    while True:
+                        chunk = f.read(chunk_size)
+                        if not chunk:
+                            break
+                        await response.write(chunk)
+            finally:
+                # Delete the file after sending
+                try:
+                    os.remove(file_path)
+                except Exception as e:
+                    logging.error(f"Error deleting file: {e}")
+
+            await response.write_eof()
+            return response
 
         @routes.get("/view_metadata/{folder_name}")
         async def view_metadata(request):
@@ -600,6 +849,8 @@ class PromptServer():
 
         @routes.post("/prompt")
         async def post_prompt(request):
+            request: web.Request = request
+            
             logging.info("got prompt")
             json_data =  await request.json()
             json_data = self.trigger_on_prompt(json_data)
@@ -634,7 +885,91 @@ class PromptServer():
                     return web.json_response({"error": valid[1], "node_errors": valid[3]}, status=400)
             else:
                 return web.json_response({"error": "no prompt", "node_errors": []}, status=400)
+        @routes.post("/prompt_sync")
+        async def post_prompt(request):
+            request: web.Request = request
+            
+            logging.info("got prompt")
+            resp_code = 200
+            out_string = ""
+            json_data =  await request.json()
+            json_data = self.trigger_on_prompt(json_data)
 
+            if "number" in json_data:
+                number = float(json_data['number'])
+            else:
+                number = self.number
+                if "front" in json_data:
+                    if json_data['front']:
+                        number = -number
+
+                self.number += 1
+
+            if "prompt" in json_data:
+                prompt = json_data["prompt"]
+                valid = execution.validate_prompt(prompt)
+                extra_data = {}
+                if "extra_data" in json_data:
+                    extra_data = json_data["extra_data"]
+
+                if "client_id" in json_data:
+                    extra_data["client_id"] = json_data["client_id"]
+                if valid[0]:
+                    prompt_id = str(uuid.uuid4())
+                    outputs_to_execute = valid[2]
+                    self.prompt_queue.put((number, prompt_id, prompt, extra_data, outputs_to_execute))
+                    # wait for the prompt to finish
+                    while self.prompt_queue.get_tasks_remaining() > 0:
+                        await asyncio.sleep(0.1)
+                    result_history = self.prompt_queue.get_history(prompt_id=prompt_id)
+                    outputs = result_history.get(prompt_id, {}).get("outputs", {})
+                    files_to_view = []
+                    for output in outputs.values():
+                        if "images" in output:
+                            for image in output["images"]:
+                                if "filename" in image:
+                                    files_to_view.append({
+                                        'filename': image['filename'],
+                                        'output_type': image.get('type', 'output'),
+                                        'subfolder': image.get('subfolder'),
+                                        # 'preview' and 'channel' can be added if available
+                                    })
+                    response_files_data = []
+                    for file_info in files_to_view:
+                        image_info = await view_image_parsed(
+                            filename=file_info['filename'],
+                            output_type=file_info.get('output_type', 'output'),
+                            subfolder=file_info.get('subfolder'),
+                            preview=None,  # or set this if needed
+                            channel='rgba',  # or set this if needed
+                            remove_after=True
+                        )
+                        if image_info is not None:
+                            # Encode the image data in base64
+                            import base64
+                            encoded_image = base64.b64encode(image_info['content']).decode('utf-8')
+                            response_files_data.append({
+                                'filename': image_info['filename'],
+                                'image_data': encoded_image,
+                                'content_type': image_info['content_type'],
+                            })
+                        else:
+                            # Handle the case where the image could not be read
+                            logging.error(f"Failed to process image: {file_info['filename']}")
+
+                    response = {
+                        "prompt_id": prompt_id,
+                        "number": number,
+                        "node_errors": valid[3],
+                        "images": response_files_data
+                    }
+                    return web.json_response(response)
+
+                else:
+                    logging.warning("invalid prompt: {}".format(valid[1]))
+                    return web.json_response({"error": valid[1], "node_errors": valid[3]}, status=400)
+            else:
+                return web.json_response({"error": "no prompt", "node_errors": []}, status=400)
         @routes.post("/queue")
         async def post_queue(request):
             json_data =  await request.json()
