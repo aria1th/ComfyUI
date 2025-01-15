@@ -2,7 +2,7 @@
 
 # ComfyUI
 **The most powerful and modular diffusion model GUI and backend.**
-
+# Dummy
 
 [![Website][website-shield]][website-url]
 [![Dynamic JSON Badge][discord-shield]][discord-url]
