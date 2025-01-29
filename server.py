@@ -914,6 +914,11 @@ class PromptServer():
 
                 if "client_id" in json_data:
                     extra_data["client_id"] = json_data["client_id"]
+                
+                if "remove_after" in json_data:
+                    remove_after = json_data["remove_after"]
+                else:
+                    remove_after = True
                 if valid[0]:
                     prompt_id = str(uuid.uuid4())
                     outputs_to_execute = valid[2]
@@ -942,7 +947,7 @@ class PromptServer():
                             subfolder=file_info.get('subfolder'),
                             preview=None,  # or set this if needed
                             channel='rgba',  # or set this if needed
-                            remove_after=True
+                            remove_after=remove_after
                         )
                         if image_info is not None:
                             # Encode the image data in base64
