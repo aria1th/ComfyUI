@@ -15,15 +15,18 @@ formatter = logging.Formatter(
 handler.setFormatter(formatter)
 logger.addHandler(handler)
 
+
 # Custom logging filter to include client IP
 class ContextFilter(logging.Filter):
     def filter(self, record):
-        record.clientip = getattr(record, 'clientip', 'unknown')
+        record.clientip = getattr(record, "clientip", "unknown")
         return True
+
 
 logger.addFilter(ContextFilter())
 
 app = FastAPI()
+
 
 # Middleware to log each request
 @app.middleware("http")
@@ -31,14 +34,25 @@ async def log_requests(request: Request, call_next):
     response = await call_next(request)
     # Log the request
     logger.info(
-        '',
+        "",
         extra={
-            'clientip': request.client.host,
-            'request_line': f"{request.method} {request.url.path} HTTP/{request.scope.get('http_version', '1.1')}",
-            'status_code': response.status_code
-        }
+            "clientip": request.client.host,
+            "request_line": f"{request.method} {request.url.path} HTTP/{request.scope.get('http_version', '1.1')}",
+            "status_code": response.status_code,
+        },
     )
     return response
+
+
+def get_extra_from_request(request: Request, status_code: int):
+    return {
+        "clientip": request.client.host,
+        "request_line": f"{request.method} {request.url.path} HTTP/{request.scope.get('http_version', '1.1')}",
+        "status_code": (
+            status_code if status_code else 301
+        ),  # Default to 301 if status_code is None
+    }
+
 
 TIMEOUT_SECONDS = 600
 MAX_REQUEST_SIZE = 30 * 1024 * 1024  # Limit request size to 30MB
@@ -53,42 +67,45 @@ index_lock = asyncio.Lock()
 async def prompt(request: Request):
     try:
         data = await request.body()
-
+        endpoint = None
         # Limit request size
         if len(data) > MAX_REQUEST_SIZE:
             return Response(content="Request too large", status_code=413)
 
         headers = dict(request.headers)
         # Remove headers that should not be forwarded
-        headers.pop('host', None)
-        headers.pop('content-length', None)
+        headers.pop("host", None)
+        headers.pop("content-length", None)
 
         # 3) Round-robin: pick the next endpoint
         global current_index
         async with index_lock:
             endpoint = WORKER_ENDPOINTS[current_index]
             current_index = (current_index + 1) % len(WORKER_ENDPOINTS)
-
+        logger.info(
+            "Forwarding request to worker: " + endpoint,
+            extra=get_extra_from_request(request, 200),
+        )
         async with httpx.AsyncClient() as client:
             response = await client.post(
-                endpoint,
-                content=data,
-                headers=headers,
-                timeout=TIMEOUT_SECONDS
+                endpoint, content=data, headers=headers, timeout=TIMEOUT_SECONDS
             )
 
         return Response(
             content=response.content,
             status_code=response.status_code,
             headers=dict(response.headers),
-            media_type=response.headers.get('content-type')
+            media_type=response.headers.get("content-type"),
         )
     except Exception as e:
-        logger.error("Error processing request", exc_info=e)
+        err_message = f"Error processing request while forwarding to worker: {endpoint}, stacktrace: {e}"
+        logger.error(err_message, extra=get_extra_from_request(request, 500))
         return Response(content="Internal Server Error", status_code=500)
+
 
 if __name__ == "__main__":
     import argparse
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=9000)
     args = parser.parse_args()
