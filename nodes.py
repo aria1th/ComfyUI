@@ -773,16 +773,17 @@ class VAELoader:
 class ControlNetLoader:
     @classmethod
     def INPUT_TYPES(s):
-        return {"required": { "control_net_name": (folder_paths.get_filename_list("controlnet"), )}}
+        return {"required": { "control_net_name": (folder_paths.get_filename_list("controlnet"), )},
+                "optional": { "decay": (["None", "linear_up","linear_down", "sigmoid", "step"],),}}
 
     RETURN_TYPES = ("CONTROL_NET",)
     FUNCTION = "load_controlnet"
 
     CATEGORY = "loaders"
 
-    def load_controlnet(self, control_net_name):
+    def load_controlnet(self, control_net_name, decay="None"):
         controlnet_path = folder_paths.get_full_path_or_raise("controlnet", control_net_name)
-        controlnet = comfy.controlnet.load_controlnet(controlnet_path)
+        controlnet = comfy.controlnet.load_controlnet(controlnet_path, decay=decay)
         return (controlnet,)
 
 class DiffControlNetLoader:

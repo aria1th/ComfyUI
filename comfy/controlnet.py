@@ -62,6 +62,10 @@ def broadcast_image_to(tensor, target_batch_size, batched_number):
 class StrengthType(Enum):
     CONSTANT = 1
     LINEAR_UP = 2
+    LINEAR_DOWN = 3
+    LINEAR_UP_FRACTION = 4
+    SIGMOID = 5
+    STEP = 6
 
 class ControlBase:
     def __init__(self):
@@ -88,6 +92,7 @@ class ControlBase:
     def set_cond_hint(self, cond_hint, strength=1.0, timestep_percent_range=(0.0, 1.0), vae=None, extra_concat=[]):
         self.cond_hint_original = cond_hint
         self.strength = strength
+        self.orig_strength = strength
         self.timestep_percent_range = timestep_percent_range
         if self.latent_format is not None:
             if vae is None:
@@ -97,6 +102,54 @@ class ControlBase:
         if self.concat_mask and len(self.extra_concat_orig) == 0:
             self.extra_concat_orig.append(torch.tensor([[[[1.0]]]]))
         return self
+    
+    def adjust_strength(self, t):
+        self.strength = self.orig_strength * self.get_strength_multiplier(t)
+        print("Timestep: ", t)
+        print("Strength: ", self.strength)
+
+    def get_strength_multiplier(self, t):
+        if self.strength_type == StrengthType.CONSTANT:
+            # Always return factor = 1
+            return 1.0
+        if t[0] != t[1]:
+            print("Timestep: ", t)
+        t = t[0]
+        if t > 100:
+            cur_p = 0
+
+        # Convert t into normalized [0..1] range based on timestep_range
+        min_t, max_t = min(self.timestep_range), max(self.timestep_range)
+        # Prevent division by zero if min_t == max_t
+        if max_t == min_t:
+            cur_p = 0.0
+        else:
+            cur_p = (t - min_t) / (max_t - min_t)
+
+        # Clamp cur_p to [0..1] just in case
+        cur_p = max(0.0, min(1.0, cur_p))
+
+        # Handle each StrengthType
+        if self.strength_type == StrengthType.LINEAR_UP_FRACTION:
+            # Goes from 0 at start (t = min_t) to 1 at end (t = max_t)
+            return cur_p
+
+        elif self.strength_type == StrengthType.LINEAR_DOWN:
+            # Goes from 1 at start (t = min_t) down to 0 at end (t = max_t)
+            return 1.0 - cur_p
+
+        elif self.strength_type == StrengthType.SIGMOID:
+            # Smoothly transitions from ~0 to ~1 across the range.
+            # Adjust the 12 and 0.5 constants to change steepness and midpoint.
+            return 1.0 / (1.0 + math.exp(-12.0 * (cur_p - 0.5)))
+
+        elif self.strength_type == StrengthType.STEP:
+            # Remain slow decrease until some cutoff (e.g., 80%), then drastically drop to 0.
+            alpha = math.log(0.16) / math.log(0.8)
+            return 1 - cur_p**alpha
+
+        # Default fall-back if needed
+        return 1.0
 
     def pre_run(self, model, percent_to_timestep_function):
         self.timestep_range = (percent_to_timestep_function(self.timestep_percent_range[0]), percent_to_timestep_function(self.timestep_percent_range[1]))
@@ -220,12 +273,13 @@ class ControlNet(ControlBase):
             control_prev = self.previous_controlnet.get_control(x_noisy, t, cond, batched_number, transformer_options)
 
         if self.timestep_range is not None:
+            # if out of range, return previous control
             if t[0] > self.timestep_range[0] or t[0] < self.timestep_range[1]:
                 if control_prev is not None:
                     return control_prev
                 else:
                     return None
-
+        self.adjust_strength(t)
         dtype = self.control_model.dtype
         if self.manual_cast_dtype is not None:
             dtype = self.manual_cast_dtype
@@ -540,7 +594,6 @@ def load_controlnet_sd35(sd, model_options={}):
     return control
 
 
-
 def load_controlnet_hunyuandit(controlnet_data, model_options={}):
     model_config, operations, load_device, unet_dtype, manual_cast_dtype, offload_device = controlnet_config(controlnet_data, model_options=model_options)
 
@@ -588,7 +641,7 @@ def convert_mistoline(sd):
     return comfy.utils.state_dict_prefix_replace(sd, {"single_controlnet_blocks.": "controlnet_single_blocks."})
 
 
-def load_controlnet_state_dict(state_dict, model=None, model_options={}):
+def load_controlnet_state_dict(state_dict, model=None, model_options={}, decay=None):
     controlnet_data = state_dict
     if 'after_proj_list.18.bias' in controlnet_data.keys(): #Hunyuan DiT
         return load_controlnet_hunyuandit(controlnet_data, model_options=model_options)
@@ -598,6 +651,16 @@ def load_controlnet_state_dict(state_dict, model=None, model_options={}):
 
     controlnet_config = None
     supported_inference_dtypes = None
+    strength_type=StrengthType.CONSTANT
+    if decay:
+        if decay == "linear_up":
+            strength_type = StrengthType.LINEAR_UP_FRACTION
+        elif decay == "linear_down":
+            strength_type = StrengthType.LINEAR_DOWN
+        elif decay == "sigmoid":
+            strength_type = StrengthType.SIGMOID
+        elif decay == "step":
+            strength_type = StrengthType.STEP
 
     if "controlnet_cond_embedding.conv_in.weight" in controlnet_data: #diffusers format
         controlnet_config = comfy.model_detection.unet_config_from_diffusers_unet(controlnet_data)
@@ -738,16 +801,16 @@ def load_controlnet_state_dict(state_dict, model=None, model_options={}):
         logging.debug("unexpected controlnet keys: {}".format(unexpected))
 
     global_average_pooling = model_options.get("global_average_pooling", False)
-    control = ControlNet(control_model, global_average_pooling=global_average_pooling, load_device=load_device, manual_cast_dtype=manual_cast_dtype)
+    control = ControlNet(control_model, global_average_pooling=global_average_pooling, load_device=load_device, manual_cast_dtype=manual_cast_dtype, strength_type=strength_type)
     return control
 
-def load_controlnet(ckpt_path, model=None, model_options={}):
+def load_controlnet(ckpt_path, model=None, model_options={}, decay=None):
     if "global_average_pooling" not in model_options:
         filename = os.path.splitext(ckpt_path)[0]
         if filename.endswith("_shuffle") or filename.endswith("_shuffle_fp16"): #TODO: smarter way of enabling global_average_pooling
             model_options["global_average_pooling"] = True
 
-    cnet = load_controlnet_state_dict(comfy.utils.load_torch_file(ckpt_path, safe_load=True), model=model, model_options=model_options)
+    cnet = load_controlnet_state_dict(comfy.utils.load_torch_file(ckpt_path, safe_load=True), model=model, model_options=model_options, decay=decay)
     if cnet is None:
         logging.error("error checkpoint does not contain controlnet or t2i adapter data {}".format(ckpt_path))
     return cnet
@@ -781,7 +844,7 @@ class T2IAdapter(ControlBase):
                     return control_prev
                 else:
                     return None
-
+        self.adjust_strength(t)
         if self.cond_hint is None or x_noisy.shape[2] * self.compression_ratio != self.cond_hint.shape[2] or x_noisy.shape[3] * self.compression_ratio != self.cond_hint.shape[3]:
             if self.cond_hint is not None:
                 del self.cond_hint
