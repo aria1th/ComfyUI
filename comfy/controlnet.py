@@ -138,8 +138,8 @@ class ControlBase:
 
     def adjust_strength(self, t):
         self.strength = self.orig_strength * self.get_strength_multiplier(t)
-        #print("Timestep: ", t)
-        #print("Strength: ", self.strength)
+        print("Timestep: ", t)
+        print("Strength: ", self.strength)
 
     def find_interpolated_percentage(self, x):
         if x > TIMESTEPS_SIGMAS[0]:
@@ -176,9 +176,18 @@ class ControlBase:
             print("Timestep: ", t)
         t = t[0].item()
         cur_p = self.find_interpolated_percentage(t)
-        #print("Percentage: ", cur_p)
+        # print("Percentage: ", cur_p)
         cur_p = cur_p / 100.0
         # Clamp cur_p to [0..1] just in case
+        cur_p = max(0.0, min(1.0, cur_p))
+        # get timestep_percent_range (for example, 0.2~0.8) then 0.2 -> 0, 0.8 -> 1
+        if cur_p < self.timestep_percent_range[0]:
+            return 0.0
+        if cur_p > self.timestep_percent_range[1]:
+            return 0.0
+        if self.timestep_percent_range[0] == self.timestep_percent_range[1]: #don't divide by zero
+            return 0.0
+        cur_p = (cur_p - self.timestep_percent_range[0]) / (self.timestep_percent_range[1] - self.timestep_percent_range[0])
         cur_p = max(0.0, min(1.0, cur_p))
 
         # Handle each StrengthType
@@ -192,7 +201,7 @@ class ControlBase:
 
         elif self.strength_type == StrengthType.SIGMOID:
             # Smoothly transitions from ~0 to ~1 across the range.
-                # Adjust the 12 and 0.5 constants to change steepness and midpoint.
+            # Adjust the 12 and 0.5 constants to change steepness and midpoint.
             return 1.0 / (1.0 + math.exp(-12.0 * (cur_p - 0.5)))
 
         elif self.strength_type == StrengthType.INVERSE_SIGMOID:
@@ -281,6 +290,8 @@ class ControlBase:
                             x *= self.strength
                         elif self.strength_type == StrengthType.LINEAR_UP:
                             x *= (self.strength ** float(len(control_output) - i))
+                        else:
+                            x *= self.strength
 
                     if output_dtype is not None and x.dtype != output_dtype:
                         x = x.to(output_dtype)
