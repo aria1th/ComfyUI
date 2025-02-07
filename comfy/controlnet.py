@@ -16,7 +16,7 @@
     along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
 
-
+import numpy as np
 import torch
 from enum import Enum
 import math
@@ -67,6 +67,38 @@ class StrengthType(Enum):
     SIGMOID = 5
     STEP = 6
 
+TIMESTEPS_SIGMAS = np.array(
+    [
+        4518.7637,
+        56.1782,
+        25.8996,
+        15.9601,
+        11.0937,
+        8.2472,
+        6.4033,
+        5.1264,
+        4.1991,
+        3.5009,
+        2.9599,
+        2.5307,
+        2.1830,
+        1.8964,
+        1.6563,
+        1.4522,
+        1.2763,
+        1.1227,
+        0.9869,
+        0.8653,
+        0.7552,
+        0.6540,
+        0.5598,
+        0.4703,
+        0.3832,
+        0.2950,
+        0.1976,
+        0.0292,
+    ]
+)
 class ControlBase:
     def __init__(self):
         self.cond_hint_original = None
@@ -102,11 +134,38 @@ class ControlBase:
         if self.concat_mask and len(self.extra_concat_orig) == 0:
             self.extra_concat_orig.append(torch.tensor([[[[1.0]]]]))
         return self
-    
+
     def adjust_strength(self, t):
         self.strength = self.orig_strength * self.get_strength_multiplier(t)
-        print("Timestep: ", t)
-        print("Strength: ", self.strength)
+        #print("Timestep: ", t)
+        #print("Strength: ", self.strength)
+
+    def find_interpolated_percentage(self, x):
+        if x > TIMESTEPS_SIGMAS[0]:
+            return 0.0
+        elif x <= 0:
+            return 100.0
+        else:
+            # Find the nearest two indices
+            index = np.searchsorted(-TIMESTEPS_SIGMAS, -x)  # Get the insertion index
+            if index == 0:
+                return 0.0
+            elif index >= len(TIMESTEPS_SIGMAS):
+                return 100.0
+
+            # Get the two bounding values
+            x1, x2 = TIMESTEPS_SIGMAS[index - 1], TIMESTEPS_SIGMAS[index]
+            p1, p2 = (index - 1) / len(TIMESTEPS_SIGMAS) * 100, index / len(
+                TIMESTEPS_SIGMAS
+            ) * 100
+
+            # Perform local exponential interpolation
+            if x1 == x2:
+                return p1  # Avoid division by zero
+
+            alpha = (np.log(x) - np.log(x1)) / (np.log(x2) - np.log(x1))
+            percentage = p1 + (p2 - p1) * alpha
+            return percentage
 
     def get_strength_multiplier(self, t):
         if self.strength_type == StrengthType.CONSTANT:
@@ -114,18 +173,10 @@ class ControlBase:
             return 1.0
         if t[0] != t[1]:
             print("Timestep: ", t)
-        t = t[0]
-        if t > 100:
-            cur_p = 0
-
-        # Convert t into normalized [0..1] range based on timestep_range
-        min_t, max_t = min(self.timestep_range), max(self.timestep_range)
-        # Prevent division by zero if min_t == max_t
-        if max_t == min_t:
-            cur_p = 0.0
-        else:
-            cur_p = (t - min_t) / (max_t - min_t)
-
+        t = t[0].item()
+        cur_p = self.find_interpolated_percentage(t)
+        #print("Percentage: ", cur_p)
+        cur_p = cur_p / 100.0
         # Clamp cur_p to [0..1] just in case
         cur_p = max(0.0, min(1.0, cur_p))
 
@@ -140,13 +191,16 @@ class ControlBase:
 
         elif self.strength_type == StrengthType.SIGMOID:
             # Smoothly transitions from ~0 to ~1 across the range.
-            # Adjust the 12 and 0.5 constants to change steepness and midpoint.
+                # Adjust the 12 and 0.5 constants to change steepness and midpoint.
             return 1.0 / (1.0 + math.exp(-12.0 * (cur_p - 0.5)))
 
         elif self.strength_type == StrengthType.STEP:
             # Remain slow decrease until some cutoff (e.g., 80%), then drastically drop to 0.
             alpha = math.log(0.16) / math.log(0.8)
             return 1 - cur_p**alpha
+        elif self.strength_type == StrengthType.LINEAR_UP:
+            # Goes from 0 at start (t = min_t) to 1 at end (t = max_t)
+            return cur_p
 
         # Default fall-back if needed
         return 1.0
@@ -661,7 +715,6 @@ def load_controlnet_state_dict(state_dict, model=None, model_options={}, decay=N
             strength_type = StrengthType.SIGMOID
         elif decay == "step":
             strength_type = StrengthType.STEP
-
     if "controlnet_cond_embedding.conv_in.weight" in controlnet_data: #diffusers format
         controlnet_config = comfy.model_detection.unet_config_from_diffusers_unet(controlnet_data)
         diffusers_keys = comfy.utils.unet_to_diffusers(controlnet_config)
