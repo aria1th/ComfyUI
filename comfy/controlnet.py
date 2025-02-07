@@ -65,7 +65,8 @@ class StrengthType(Enum):
     LINEAR_DOWN = 3
     LINEAR_UP_FRACTION = 4
     SIGMOID = 5
-    STEP = 6
+    INVERSE_SIGMOID = 6
+    STEP = 7
 
 TIMESTEPS_SIGMAS = np.array(
     [
@@ -193,6 +194,10 @@ class ControlBase:
             # Smoothly transitions from ~0 to ~1 across the range.
                 # Adjust the 12 and 0.5 constants to change steepness and midpoint.
             return 1.0 / (1.0 + math.exp(-12.0 * (cur_p - 0.5)))
+
+        elif self.strength_type == StrengthType.INVERSE_SIGMOID:
+            # Smoothly transitions from ~1 to ~0 across the range.
+            return 1.0 - 1.0 / (1.0 + math.exp(-12.0 * (cur_p - 0.5)))
 
         elif self.strength_type == StrengthType.STEP:
             # Remain slow decrease until some cutoff (e.g., 80%), then drastically drop to 0.
@@ -713,6 +718,8 @@ def load_controlnet_state_dict(state_dict, model=None, model_options={}, decay=N
             strength_type = StrengthType.LINEAR_DOWN
         elif decay == "sigmoid":
             strength_type = StrengthType.SIGMOID
+        elif decay == "inverse_sigmoid":
+            strength_type = StrengthType.INVERSE_SIGMOID
         elif decay == "step":
             strength_type = StrengthType.STEP
     if "controlnet_cond_embedding.conv_in.weight" in controlnet_data: #diffusers format

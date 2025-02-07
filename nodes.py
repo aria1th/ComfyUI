@@ -774,7 +774,7 @@ class ControlNetLoader:
     @classmethod
     def INPUT_TYPES(s):
         return {"required": { "control_net_name": (folder_paths.get_filename_list("controlnet"), )},
-                "optional": { "decay": (["None", "linear_up","linear_down", "sigmoid", "step"],),}}
+                "optional": { "decay": (["None", "linear_up","linear_down", "sigmoid","inverse_sigmoid", "step"],),}}
 
     RETURN_TYPES = ("CONTROL_NET",)
     FUNCTION = "load_controlnet"
