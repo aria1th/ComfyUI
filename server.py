@@ -928,6 +928,8 @@ class PromptServer():
                         await asyncio.sleep(0.1)
                     result_history = self.prompt_queue.get_history(prompt_id=prompt_id)
                     outputs = result_history.get(prompt_id, {}).get("outputs", {})
+                    if not outputs:
+                        logging.error(f"Cannot parse output for {prompt_id}")
                     files_to_view = []
                     for output in outputs.values():
                         if "images" in output:
@@ -939,6 +941,10 @@ class PromptServer():
                                         'subfolder': image.get('subfolder'),
                                         # 'preview' and 'channel' can be added if available
                                     })
+                                else:
+                                    logging.warning(f"Cannot find filename in image output, supported attributes are {image.keys()}")
+                        else:
+                            logging.error(f"Cannot find images attribute from output for {prompt_id}")
                     response_files_data = []
                     for file_info in files_to_view:
                         image_info = await view_image_parsed(
