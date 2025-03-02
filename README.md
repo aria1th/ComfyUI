@@ -3,7 +3,6 @@
 # ComfyUI
 **The most powerful and modular visual AI engine and application.**
 
-
 [![Website][website-shield]][website-url]
 [![Dynamic JSON Badge][discord-shield]][discord-url]
 [![Matrix][matrix-shield]][matrix-url]
