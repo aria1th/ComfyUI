@@ -4,12 +4,14 @@ import json
 import logging
 import asyncio
 import httpx
+import random
 import ssl
 import threading
+import time
 from collections import defaultdict
 from typing import Optional
 from fastapi import FastAPI, Request, Response, BackgroundTasks
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse
 import uvicorn
 import websocket  # from "websocket-client" package
 
@@ -18,8 +20,8 @@ import websocket  # from "websocket-client" package
 # ==========================
 
 logger = logging.getLogger("Balancer")
-logger.setLevel(logging.DEBUG)
-handler = logging.FileHandler("./balancer.log")  # Specify your log file path
+logger.setLevel(logging.WARNING)
+handler = logging.FileHandler("./balancer.log")
 formatter = logging.Formatter(
     '%(asctime)s - %(levelname)s - %(clientip)s - "%(request_line)s" %(status_code)s %(message)s'
 )
@@ -28,17 +30,12 @@ logger.addHandler(handler)
 
 class ContextFilter(logging.Filter):
     def filter(self, record):
-        # Provide default values for any missing fields in the LogRecord
         record.clientip = getattr(record, "clientip", "unknown")
         return True
 
 logger.addFilter(ContextFilter())
 
-
 def default_logger_info(msg, extra=None):
-    """
-    Helper to log with the default logger.
-    """
     logger.info(
         msg,
         extra={"clientip": "N/A", "request_line": "N/A", "status_code": 200} if extra is None else extra
@@ -53,9 +50,6 @@ app = FastAPI()
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
-    """
-    Middleware to log each incoming request.
-    """
     response = await call_next(request)
     logger.info(
         "",
@@ -68,9 +62,6 @@ async def log_requests(request: Request, call_next):
     return response
 
 def get_extra_from_request(request: Request, status_code: int):
-    """
-    Helper for constructing log 'extra' dict for consistent logging.
-    """
     return {
         "clientip": request.client.host,
         "request_line": f"{request.method} {request.url.path} HTTP/{request.scope.get('http_version', '1.1')}",
@@ -85,55 +76,84 @@ def get_extra_from_request(request: Request, status_code: int):
 TIMEOUT_SECONDS = 600
 MAX_REQUEST_SIZE = 30 * 1024 * 1024  # 30 MB
 
-# Worker endpoints (comma-separated via ENV or default):
 worker_endpoints_str = os.getenv(
     "WORKER_ENDPOINTS",
     ""
 )
-
 WORKER_ENDPOINTS = [
     endpoint.strip() for endpoint in worker_endpoints_str.split(",") if endpoint.strip()
 ]
 
-# Concurrency limit per worker:
 CONCURRENCY_LIMIT = 1
-
-# We keep a semaphore per worker to manage concurrency
 WORKER_SEMAPHORES = [asyncio.Semaphore(CONCURRENCY_LIMIT) for _ in WORKER_ENDPOINTS]
 
-# Round-robin index lock
-current_index = 0
-index_lock = asyncio.Lock()
-
-# A simple in-memory store for progress logs keyed by prompt_id
 PROMPT_PROGRESS_LOGS = defaultdict(list)
 
-# A dictionary to track which worker is processing each prompt_id:
-# { prompt_id: { "worker_index": i, "status": "running" or "done"/"error", ... } }
+# Track worker usage for each prompt_id
 ACTIVE_CONNECTIONS = {}
 
-# A global queue for requests that cannot find a suitable worker right away
+# A global queue for requests that cannot find a slot right away
 PENDING_QUEUE = asyncio.Queue()
 
-# For thread-safe access to PROMPT_PROGRESS_LOGS and ACTIVE_CONNECTIONS, we use a lock:
+# Lock to protect queue dispatch
+enqueue_lock = asyncio.Lock()
+
+# Protect access to PROMPT_PROGRESS_LOGS and ACTIVE_CONNECTIONS
 progress_data_lock = threading.Lock()
+
+# ==========================
+# STATISTICS TRACKING
+# ==========================
+
+WORKER_STATS = {
+    i: {
+        "num_requests": 0,
+        "total_time": 0.0,
+        "max_time": 0.0,
+        "min_time": float("inf"),
+        "avg_time": 0.0,
+    }
+    for i in range(len(WORKER_ENDPOINTS))
+}
+
+GLOBAL_STATS = {
+    "num_requests": 0,
+    "total_time": 0.0,
+    "max_time": 0.0,
+    "min_time": float("inf"),
+    "avg_time": 0.0,
+}
+
+stats_lock = asyncio.Lock()
+
+def update_stats(worker_index: int, duration: float):
+    wstats = WORKER_STATS[worker_index]
+    wstats["num_requests"] += 1
+    wstats["total_time"] += duration
+    wstats["max_time"] = max(wstats["max_time"], duration)
+    wstats["min_time"] = min(wstats["min_time"], duration)
+    wstats["avg_time"] = wstats["total_time"] / wstats["num_requests"]
+
+    GLOBAL_STATS["num_requests"] += 1
+    GLOBAL_STATS["total_time"] += duration
+    GLOBAL_STATS["max_time"] = max(GLOBAL_STATS["max_time"], duration)
+    GLOBAL_STATS["min_time"] = min(GLOBAL_STATS["min_time"], duration)
+    GLOBAL_STATS["avg_time"] = GLOBAL_STATS["total_time"] / GLOBAL_STATS["num_requests"]
 
 
 # ==========================
-# WEBSOCKET PROGRESS (Blocking => Thread)
+# WEBSOCKET PROGRESS TRACKER
 # ==========================
 
 def track_worker_progress_ws_blocking(ws_url: str, client_id: str, prompt_id: str):
     """
-    Connects via WebSocket using the *blocking* websocket-client library,
-    listens for progress messages, logs them, and updates data structures
-    in a thread-safe manner.
+    Blocks in a separate thread, reading progress from the worker's WebSocket
+    and updating PROMPT_PROGRESS_LOGS / ACTIVE_CONNECTIONS.
     """
     logger.info(
         f"[WS] Connecting in a dedicated thread to {ws_url}",
         extra={"clientip": "N/A", "request_line": "WS-Connect", "status_code": 101}
     )
-
     ws = websocket.WebSocket()
     try:
         ws.connect(ws_url)
@@ -180,7 +200,7 @@ def track_worker_progress_ws_blocking(ws_url: str, client_id: str, prompt_id: st
                     with progress_data_lock:
                         PROMPT_PROGRESS_LOGS[prompt_id].append(f"Finished node: {node_id}")
 
-                # If data['node'] is None AND data['prompt_id'] == prompt_id => done
+                # If node_id is None and data['prompt_id'] == prompt_id => generation done
                 if node_id is None and data.get("prompt_id") == prompt_id:
                     default_logger_info(f"[WS] {prompt_id} => Generation completed.")
                     with progress_data_lock:
@@ -188,8 +208,8 @@ def track_worker_progress_ws_blocking(ws_url: str, client_id: str, prompt_id: st
                         if prompt_id in ACTIVE_CONNECTIONS:
                             ACTIVE_CONNECTIONS[prompt_id]["status"] = "done"
                     break
+
             elif msg_type == "status":
-                # mark as done
                 default_logger_info(f"[WS] {prompt_id} => Status message: {payload}")
                 with progress_data_lock:
                     if prompt_id in ACTIVE_CONNECTIONS:
@@ -206,7 +226,6 @@ def track_worker_progress_ws_blocking(ws_url: str, client_id: str, prompt_id: st
             f"[WS] Error in progress loop for prompt {prompt_id}: {wsex}",
             extra={"clientip": "N/A", "request_line": "WS-Error", "status_code": 200}
         )
-        # Mark prompt as "error" if not done
         with progress_data_lock:
             if prompt_id in ACTIVE_CONNECTIONS:
                 current_status = ACTIVE_CONNECTIONS[prompt_id].get("status")
@@ -218,7 +237,6 @@ def track_worker_progress_ws_blocking(ws_url: str, client_id: str, prompt_id: st
             f"[WS] Connection closed for prompt_id={prompt_id}",
             extra={"clientip": "N/A", "request_line": "WS-Close", "status_code": 200}
         )
-        # If we never got node=None or ended early, mark done if not error:
         with progress_data_lock:
             if prompt_id in ACTIVE_CONNECTIONS:
                 current_status = ACTIVE_CONNECTIONS[prompt_id].get("status")
@@ -230,53 +248,56 @@ def track_worker_progress_ws_blocking(ws_url: str, client_id: str, prompt_id: st
                     "status": "done (no active connection)",
                 }
 
-
 def launch_progress_thread(ws_url: str, client_id: str, prompt_id: str):
-    """
-    Spawns a dedicated thread to run the blocking WebSocket progress function.
-    """
-    thread = threading.Thread(
+    t = threading.Thread(
         target=track_worker_progress_ws_blocking,
         args=(ws_url, client_id, prompt_id),
-        daemon=True,
+        daemon=True
     )
-    thread.start()
+    t.start()
 
 
 # ==========================
-# WORKER PICKING LOGIC
+# Utility: "try_acquire_nowait" for asyncio.Semaphore
 # ==========================
 
-def worker_can_accept(i: int) -> bool:
+async def try_acquire_nowait(sem: asyncio.Semaphore) -> bool:
     """
-    Returns True if worker i can accept a new request:
-      - If concurrency_in_use < CONCURRENCY_LIMIT
-        OR concurrency_in_use == CONCURRENCY_LIMIT but requests_waiting < 1
+    Attempt to acquire `sem` immediately (no wait).
+    Return True if acquired successfully, False otherwise.
     """
-    concurrency_in_use = CONCURRENCY_LIMIT - WORKER_SEMAPHORES[i]._value
-    requests_waiting = len(WORKER_SEMAPHORES[i]._waiters) if WORKER_SEMAPHORES[i]._waiters else 0
-
-    # If concurrency usage is not maxed out, or if it's exactly max but queue is empty
-    if concurrency_in_use < CONCURRENCY_LIMIT:
+    try:
+        # If it can't be acquired immediately, we get a TimeoutError.
+        await asyncio.wait_for(sem.acquire(), timeout=0.001)
         return True
-    elif concurrency_in_use == CONCURRENCY_LIMIT and requests_waiting < 1:
-        return True
-    return False
+    except asyncio.TimeoutError:
+        return False
 
-async def pick_worker_round_robin() -> Optional[int]:
+
+# ==========================
+# Immediate Worker Acquisition
+# ==========================
+
+async def try_acquire_worker() -> Optional[int]:
     """
-    Round-robin attempt to find a worker that can accept a request.
-    Returns the worker index if found, else None.
+    Attempts an immediate concurrency slot on any worker, in random order.
+    Returns the worker index if successful, or None if none is free.
     """
-    global current_index
-    async with index_lock:
-        for _ in range(len(WORKER_ENDPOINTS)):
-            i = current_index
-            current_index = (current_index + 1) % len(WORKER_ENDPOINTS)
-            if worker_can_accept(i):
-                return i
+    indices = list(range(len(WORKER_ENDPOINTS)))
+    random.shuffle(indices)
+    for i in indices:
+        got_it = await try_acquire_nowait(WORKER_SEMAPHORES[i])
+        if got_it:
+            return i
     return None
 
+async def release_worker(worker_index: int):
+    WORKER_SEMAPHORES[worker_index].release()
+
+
+# ==========================
+# Forward Request to Worker
+# ==========================
 
 async def handle_request_on_worker(
     worker_index: int,
@@ -285,79 +306,87 @@ async def handle_request_on_worker(
     prompt_id_placeholder: str,
     request_obj: Request
 ) -> Response:
-    """
-    Submits the request to the chosen worker under a concurrency semaphore,
-    launches a thread to track progress, and returns the worker's response.
-    """
-    async with WORKER_SEMAPHORES[worker_index]:
-        endpoint = WORKER_ENDPOINTS[worker_index]
-        logger.info(
-            f"Forwarding request to worker {worker_index}: {endpoint}",
-            extra=get_extra_from_request(request_obj, 200),
-        )
+    start_time = time.monotonic()
+    endpoint = WORKER_ENDPOINTS[worker_index]
+    logger.info(
+        f"Forwarding request to worker {worker_index}: {endpoint}",
+        extra=get_extra_from_request(request_obj, 200),
+    )
 
+    try:
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 endpoint, content=request_body, headers=headers, timeout=TIMEOUT_SECONDS
             )
+    except Exception as ex:
+        logger.error(
+            f"Error contacting worker {worker_index}: {ex}",
+            extra=get_extra_from_request(request_obj, 500)
+        )
+        return Response(content="Error contacting worker", status_code=500)
 
-        # Try to parse out prompt_id
-        prompt_id = None
-        try:
-            resp_json = response.json()
-            prompt_id = resp_json.get("prompt_id")
-        except:
-            logger.error(
-                f"Error parsing response JSON from worker: {response.content}",
-                extra=get_extra_from_request(request_obj, 500)
-            )
+    duration = time.monotonic() - start_time
+    async with stats_lock:
+        update_stats(worker_index, duration)
 
-        # If we got a prompt_id, track it:
-        if prompt_id:
-            with progress_data_lock:
-                if prompt_id in ACTIVE_CONNECTIONS:
-                    logger.warning(
-                        f"Duplicate prompt_id in ACTIVE_CONNECTIONS: {prompt_id}",
-                        extra=get_extra_from_request(request_obj, 500)
-                    )
-                ACTIVE_CONNECTIONS[prompt_id] = {
-                    "worker_index": worker_index,
-                    "status": "running",
-                }
-
-            # Build the WS URL (assuming ComfyUI's ws://host:port/ws?clientId=...)
-            base_ws = endpoint.replace("http://", "ws://").replace("/prompt_sync", "")
-            client_id = str(uuid.uuid4())
-            ws_url = f"{base_ws}/ws?clientId={client_id}"
-
-            # Launch a separate thread to track progress
-            launch_progress_thread(ws_url, client_id, prompt_id)
-
-        else:
-            # If no prompt_id was provided, store a placeholder ID for logs
-            prompt_id = prompt_id_placeholder
-            logger.warning(
-                f"No real prompt_id found in worker response: {response.content}",
-                extra=get_extra_from_request(request_obj, 200)
-            )
-            with progress_data_lock:
-                ACTIVE_CONNECTIONS[prompt_id] = {
-                    "worker_index": worker_index,
-                    "status": "running (no real prompt_id)",
-                }
-
-        # Return the raw response from the worker
-        return Response(
-            content=response.content,
-            status_code=response.status_code,
-            headers=dict(response.headers),
-            media_type=response.headers.get("content-type"),
+    # Parse out prompt_id if possible
+    prompt_id = None
+    try:
+        resp_json = response.json()
+        prompt_id = resp_json.get("prompt_id")
+    except:
+        logger.error(
+            f"Error parsing worker response: {response.content}",
+            extra=get_extra_from_request(request_obj, 500)
         )
 
+    if prompt_id:
+        with progress_data_lock:
+            if prompt_id in ACTIVE_CONNECTIONS:
+                logger.warning(
+                    f"Duplicate prompt_id in ACTIVE_CONNECTIONS: {prompt_id}",
+                    extra=get_extra_from_request(request_obj, 500)
+                )
+            ACTIVE_CONNECTIONS[prompt_id] = {
+                "worker_index": worker_index,
+                "status": "running",
+            }
+
+        base_ws = endpoint.replace("http://", "ws://").replace("/prompt_sync", "")
+        client_id = str(uuid.uuid4())
+        ws_url = f"{base_ws}/ws?clientId={client_id}"
+        launch_progress_thread(ws_url, client_id, prompt_id)
+
+    else:
+        # Fallback if we didn't get a real prompt_id
+        prompt_id = prompt_id_placeholder
+        logger.warning(
+            f"No real prompt_id in response: {response.content}",
+            extra=get_extra_from_request(request_obj, 200)
+        )
+        with progress_data_lock:
+            ACTIVE_CONNECTIONS[prompt_id] = {
+                "worker_index": worker_index,
+                "status": "running (no real prompt_id)",
+            }
+
+    return Response(
+        content=response.content,
+        status_code=response.status_code,
+        headers=dict(response.headers),
+        media_type=response.headers.get("content-type"),
+    )
+
+
+# ==========================
+# Dispatch Pending Queue
+# ==========================
 
 async def dispatch_pending_requests():
     """
-    Drains the global PENDING_QUEUE if any worker becomes available.
+    Drains PENDING_QUEUE if any worker is free. We attempt an immediate
+    acquire of a worker slot. If successful, we assign that worker to the item
+    and signal the item’s event, so the original request can proceed.
     """
     while True:
         try:
@@ -365,25 +394,26 @@ async def dispatch_pending_requests():
         except asyncio.QueueEmpty:
             break
 
-        worker_index = await pick_worker_round_robin()
-        if worker_index is not None:
-            request_item["worker_index"] = worker_index
-            request_item["event"].set()
-        else:
-            # No worker is available yet—put it back & break
-            PENDING_QUEUE.put_nowait(request_item)
-            break
+        async with enqueue_lock:
+            worker_index = await try_acquire_worker()
+            if worker_index is not None:
+                request_item["worker_index"] = worker_index
+                request_item["event"].set()
+            else:
+                # Put it back and stop if none was free
+                await PENDING_QUEUE.put(request_item)
+                break
 
 
 # ==========================
-# MAIN PROMPT ENDPOINT
+# /prompt ENDPOINT
 # ==========================
 
 @app.post("/prompt")
 async def prompt(request: Request, background_tasks: BackgroundTasks):
     """
-    Receives an image/prompt-generation request, picks a worker if available,
-    or queues it if all are at capacity+1. Returns the worker's response eventually.
+    Receives a request. We attempt to acquire an immediate slot on any worker;
+    if none is free, we queue the request until a worker frees up.
     """
     try:
         data = await request.body()
@@ -394,19 +424,26 @@ async def prompt(request: Request, background_tasks: BackgroundTasks):
         headers.pop("host", None)
         headers.pop("content-length", None)
 
-        worker_index = await pick_worker_round_robin()
+        # 1. Try immediate concurrency
+        worker_index = await try_acquire_worker()
         if worker_index is not None:
-            resp = await handle_request_on_worker(
-                worker_index,
-                data,
-                headers,
-                f"temp_{uuid.uuid4()}",
-                request
-            )
-            return resp
+            # We got a slot right away
+            try:
+                resp = await handle_request_on_worker(
+                    worker_index,
+                    data,
+                    headers,
+                    f"temp_{uuid.uuid4()}",
+                    request
+                )
+                return resp
+            finally:
+                await release_worker(worker_index)
+                await dispatch_pending_requests()
+
         else:
-            # No immediate worker => place into queue
-            default_logger_info("All workers at capacity+1; queueing request.")
+            # 2. No immediate slot => queue it
+            default_logger_info("All workers busy; queueing request.")
             item_event = asyncio.Event()
             queue_item = {
                 "request_body": data,
@@ -417,49 +454,69 @@ async def prompt(request: Request, background_tasks: BackgroundTasks):
                 "worker_index": None,
             }
             await PENDING_QUEUE.put(queue_item)
-            await item_event.wait()  # Wait until a worker is free
+            await dispatch_pending_requests()
 
+            # Wait for our item to get assigned a worker
+            await item_event.wait()
             assigned_worker = queue_item["worker_index"]
-            resp = await handle_request_on_worker(
-                assigned_worker,
-                queue_item["request_body"],
-                queue_item["headers"],
-                queue_item["prompt_id_placeholder"],
-                queue_item["request_obj"],
-            )
-            return resp
+            if assigned_worker is None:
+                return Response(content="No worker assigned (unexpected)", status_code=500)
+
+            try:
+                resp = await handle_request_on_worker(
+                    assigned_worker,
+                    queue_item["request_body"],
+                    queue_item["headers"],
+                    queue_item["prompt_id_placeholder"],
+                    queue_item["request_obj"],
+                )
+                return resp
+            finally:
+                await release_worker(assigned_worker)
+                await dispatch_pending_requests()
 
     except Exception as e:
-        err_message = f"Error processing request in /prompt: {str(e)}"
+        err_message = f"Error in /prompt: {str(e)}"
         logger.error(err_message, extra=get_extra_from_request(request, 500))
         return Response(content="Internal Server Error", status_code=500)
-    finally:
-        # Always attempt to dispatch pending requests if concurrency freed up
-        await dispatch_pending_requests()
 
 
 # ==========================
-# STATUS ENDPOINTS
+# STATUS + LOGS
 # ==========================
 
 @app.get("/status")
 async def status():
-    """
-    Returns a JSON representation of each worker's concurrency usage
-    plus details on active jobs and the global queue length.
-    """
     status_info = []
     for i, endpoint in enumerate(WORKER_ENDPOINTS):
         concurrency_in_use = CONCURRENCY_LIMIT - WORKER_SEMAPHORES[i]._value
         requests_waiting = len(WORKER_SEMAPHORES[i]._waiters) if WORKER_SEMAPHORES[i]._waiters else 0
         worker_status = "idle" if concurrency_in_use == 0 else "processing"
+
+        min_time = (
+            WORKER_STATS[i]["min_time"] if WORKER_STATS[i]["min_time"] != float("inf") else 0.0
+        )
         status_info.append({
             "worker_index": i,
             "endpoint": endpoint,
             "status": worker_status,
             "concurrency_in_use": concurrency_in_use,
-            "requests_waiting": requests_waiting
+            "requests_waiting": requests_waiting,
+            "stats": {
+                "num_requests": WORKER_STATS[i]["num_requests"],
+                "avg_time": round(WORKER_STATS[i]["avg_time"], 4),
+                "max_time": round(WORKER_STATS[i]["max_time"], 4),
+                "min_time": round(min_time, 4),
+            }
         })
+
+    global_min = GLOBAL_STATS["min_time"] if GLOBAL_STATS["min_time"] != float("inf") else 0.0
+    global_stats = {
+        "num_requests": GLOBAL_STATS["num_requests"],
+        "avg_time": round(GLOBAL_STATS["avg_time"], 4),
+        "max_time": round(GLOBAL_STATS["max_time"], 4),
+        "min_time": round(global_min, 4),
+    }
 
     with progress_data_lock:
         active_jobs_list = [
@@ -473,35 +530,59 @@ async def status():
 
     return {
         "workers": status_info,
+        "global_stats": global_stats,
         "active_jobs": active_jobs_list,
         "pending_queue_length": PENDING_QUEUE.qsize(),
         "known_prompts_progress": list(PROMPT_PROGRESS_LOGS.keys()),
     }
 
-
 @app.get("/progress/{prompt_id}")
 async def get_progress(prompt_id: str):
-    """
-    Return the known progress logs for a given prompt_id (if any).
-    """
     with progress_data_lock:
         logs = PROMPT_PROGRESS_LOGS.get(prompt_id, [])
         return {"prompt_id": prompt_id, "progress": logs}
 
+@app.get("/logs", response_class=PlainTextResponse)
+async def get_logs():
+    log_file_path = "./balancer.log"
+    if not os.path.exists(log_file_path):
+        return "No log file found."
+
+    NUM_LINES = 200
+    try:
+        with open(log_file_path, "rb") as f:
+            f.seek(0, 2)
+            file_size = f.tell()
+            block_size = 1024
+            data = b""
+            lines_found = 0
+            cursor = file_size
+
+            while cursor > 0 and lines_found < NUM_LINES:
+                cursor = max(0, cursor - block_size)
+                f.seek(cursor)
+                chunk = f.read(block_size)
+                data = chunk + data
+                lines_found = data.count(b"\n")
+
+            all_lines = data.splitlines()
+            if len(all_lines) > NUM_LINES:
+                all_lines = all_lines[-NUM_LINES:]
+            return "\n".join(line.decode("utf-8", errors="replace") for line in all_lines)
+    except Exception as ex:
+        return f"Error reading logs: {ex}"
 
 @app.get("/status_page", response_class=HTMLResponse)
 async def status_page():
     """
-    Returns an HTML page that periodically fetches /status JSON (and optional /progress logs).
-    This is a simple dashboard to see concurrency usage and active jobs.
+    Simple HTML page that periodically fetches /status for a quick dashboard.
     """
     global CONCURRENCY_LIMIT
-    html_content = f"""
+    html_content = f"""\
     <!DOCTYPE html>
     <html>
     <head>
         <title>Worker Status</title>
-        <!-- Bootstrap CSS from CDN -->
         <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" />
         <style>
             .status-idle {{
@@ -551,11 +632,19 @@ async def status_page():
                 <div class="form-check">
                   <input class="form-check-input" type="checkbox" id="autoRefresh" checked>
                   <label class="form-check-label" for="autoRefresh">
-                    Auto-Refresh (every <span id="refreshIntervalValue">5</span>s)
+                    Auto-Refresh (every 5s)
                   </label>
                 </div>
             </div>
         </div>
+
+        <h4>Global Stats</h4>
+        <ul>
+            <li><strong>#Requests:</strong> <span id="globalNumRequests">0</span></li>
+            <li><strong>Avg Time (s):</strong> <span id="globalAvgTime">0</span></li>
+            <li><strong>Max Time (s):</strong> <span id="globalMaxTime">0</span></li>
+            <li><strong>Min Time (s):</strong> <span id="globalMinTime">0</span></li>
+        </ul>
 
         <table class="table table-bordered table-hover align-middle" id="statusTable">
             <thead class="table-secondary">
@@ -565,6 +654,7 @@ async def status_page():
                     <th>Status</th>
                     <th>Concurrency Usage</th>
                     <th>Requests Waiting</th>
+                    <th>Stats (#Req / Avg / Max / Min)</th>
                 </tr>
             </thead>
             <tbody>
@@ -591,9 +681,14 @@ async def status_page():
             </div>
         </div>
         <div id="progressLogs" class="log-area">(no logs)</div>
-    </div>  <!-- /container -->
 
-    <!-- Bootstrap JS (optional) + minimal custom JS for status updates -->
+        <hr class="my-4">
+
+        <h3>Production Logs</h3>
+        <button class="btn btn-secondary mb-2" id="fetchProdLogsBtn">Fetch Logs Tail (200 lines)</button>
+        <div id="prodLogs" class="log-area">(no logs)</div>
+    </div>
+
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
     <script>
         const refreshIntervalMs = 5000;
@@ -604,7 +699,12 @@ async def status_page():
             try {{
                 const response = await fetch('/status');
                 const data = await response.json();
-                
+
+                document.getElementById("globalNumRequests").textContent = data.global_stats.num_requests;
+                document.getElementById("globalAvgTime").textContent = data.global_stats.avg_time;
+                document.getElementById("globalMaxTime").textContent = data.global_stats.max_time;
+                document.getElementById("globalMinTime").textContent = data.global_stats.min_time;
+
                 const tbody = document.querySelector("#statusTable tbody");
                 tbody.innerHTML = "";
 
@@ -614,22 +714,18 @@ async def status_page():
                 data.workers.forEach((item) => {{
                     const row = document.createElement("tr");
 
-                    // Worker Index
                     const cellIndex = document.createElement("td");
                     cellIndex.textContent = item.worker_index;
-                    
-                    // Endpoint
+
                     const cellEndpoint = document.createElement("td");
                     cellEndpoint.textContent = item.endpoint;
 
-                    // Status
                     const cellStatus = document.createElement("td");
                     cellStatus.textContent = item.status;
                     cellStatus.classList.add(
                         item.status === "idle" ? "status-idle" : "status-processing"
                     );
 
-                    // Concurrency usage (progress bar)
                     const cellConcurrency = document.createElement("td");
                     cellConcurrency.className = "progress-usage";
 
@@ -655,15 +751,19 @@ async def status_page():
                     progressDiv.appendChild(progressBar);
                     cellConcurrency.appendChild(progressDiv);
 
-                    // Requests waiting
                     const cellWaiting = document.createElement("td");
                     cellWaiting.textContent = item.requests_waiting;
+
+                    const cellStats = document.createElement("td");
+                    const s = item.stats;
+                    cellStats.textContent = `${{s.num_requests}} / ${{s.avg_time}}s / ${{s.max_time}}s / ${{s.min_time}}s`;
 
                     row.appendChild(cellIndex);
                     row.appendChild(cellEndpoint);
                     row.appendChild(cellStatus);
                     row.appendChild(cellConcurrency);
                     row.appendChild(cellWaiting);
+                    row.appendChild(cellStats);
 
                     tbody.appendChild(row);
 
@@ -673,11 +773,9 @@ async def status_page():
                 document.getElementById("totalUsage").textContent = totalUsage;
                 document.getElementById("globalQueue").textContent = data.pending_queue_length || 0;
 
-                // Update last-updated timestamp
                 const now = new Date();
                 document.getElementById("lastUpdated").textContent = "Last updated: " + now.toLocaleTimeString();
 
-                // Active jobs
                 let activeJobsHtml = "";
                 data.active_jobs.forEach((job) => {{
                     activeJobsHtml += `
@@ -688,7 +786,7 @@ async def status_page():
                         </div>
                     `;
                 }});
-                if (activeJobsHtml === "") {{
+                if (!activeJobsHtml) {{
                     activeJobsHtml = "(none)";
                 }}
                 document.getElementById("activeJobsDiv").innerHTML = activeJobsHtml;
@@ -751,6 +849,17 @@ async def status_page():
             }}
         }}
 
+        async function fetchProductionLogs() {{
+            try {{
+                const resp = await fetch('/logs');
+                const textData = await resp.text();
+                document.getElementById("prodLogs").textContent = textData;
+            }} catch (err) {{
+                console.error("Error fetching production logs:", err);
+                document.getElementById("prodLogs").textContent = "(error)";
+            }}
+        }}
+
         document.addEventListener("DOMContentLoaded", () => {{
             setupAutoRefresh();
 
@@ -761,17 +870,17 @@ async def status_page():
                     fetchLogs(promptId);
                 }}
             }});
+
+            const fetchProdLogsBtn = document.getElementById("fetchProdLogsBtn");
+            fetchProdLogsBtn.addEventListener("click", () => {{
+                fetchProductionLogs();
+            }});
         }});
     </script>
     </body>
     </html>
     """
     return HTMLResponse(html_content)
-
-
-# ==========================
-# MAIN (CLI)
-# ==========================
 
 if __name__ == "__main__":
     import argparse
@@ -782,7 +891,6 @@ if __name__ == "__main__":
     parser.add_argument("--debug", action="store_true", help="Enable debug logging output (same as verbose).")
     args = parser.parse_args()
 
-    # If --debug or --verbose is set, switch logger to DEBUG
     if args.debug or args.verbose:
         logger.setLevel(logging.DEBUG)
 
