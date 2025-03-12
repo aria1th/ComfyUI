@@ -96,7 +96,7 @@ WORKER_ENDPOINTS = [
 ]
 
 # Concurrency limit per worker:
-CONCURRENCY_LIMIT = 2
+CONCURRENCY_LIMIT = 1
 
 # We keep a semaphore per worker to manage concurrency
 WORKER_SEMAPHORES = [asyncio.Semaphore(CONCURRENCY_LIMIT) for _ in WORKER_ENDPOINTS]
