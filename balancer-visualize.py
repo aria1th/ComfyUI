@@ -18,7 +18,52 @@ import websocket  # from "websocket-client" package
 # ==========================
 # CONFIGURATIONS & LOGGING
 # ==========================
+from collections import deque
 
+class StrictFifoQueue:
+    """
+    A simple FIFO queue that internally uses a deque and an asyncio.Condition
+    to allow async producers/consumers. Unlike asyncio.Queue, we also expose
+    a safe put_front() method to reinsert an item at the head.
+    """
+    def __init__(self):
+        self._items = deque()
+        self._lock = asyncio.Lock()
+        self._not_empty = asyncio.Condition(self._lock)
+
+    async def put(self, item):
+        """Add an item to the back of the queue (FIFO)."""
+        async with self._lock:
+            self._items.append(item)
+            self._not_empty.notify()  # wake up a waiting consumer if any
+
+    async def get(self):
+        """
+        Remove and return an item from the front of the queue (FIFO).
+        If empty, this method blocks until an item is available.
+        """
+        async with self._not_empty:
+            while not self._items:
+                await self._not_empty.wait()
+            return self._items.popleft()
+
+    async def put_front(self, item):
+        """
+        Reinsert an item at the front of the queue.
+        This is useful if you dequeue an item but then discover you cannot
+        process it yet and want to preserve its FIFO position.
+        """
+        async with self._lock:
+            self._items.appendleft(item)
+            self._not_empty.notify()
+
+    def empty(self) -> bool:
+        """Check quickly if the queue is empty (non-async)."""
+        return len(self._items) == 0
+
+    def qsize(self) -> int:
+        """Get the current size of the queue (non-async)."""
+        return len(self._items)
 logger = logging.getLogger("Balancer")
 logger.setLevel(logging.WARNING)
 handler = logging.FileHandler("./balancer.log")
@@ -93,7 +138,8 @@ PROMPT_PROGRESS_LOGS = defaultdict(list)
 ACTIVE_CONNECTIONS = {}
 
 # A global queue for requests that cannot find a slot right away
-PENDING_QUEUE = asyncio.Queue()
+PENDING_QUEUE = StrictFifoQueue()
+
 
 # Lock to protect queue dispatch
 enqueue_lock = asyncio.Lock()
@@ -381,27 +427,30 @@ async def handle_request_on_worker(
 # ==========================
 # Dispatch Pending Queue
 # ==========================
-
 async def dispatch_pending_requests():
     """
-    Drains PENDING_QUEUE if any worker is free. We attempt an immediate
-    acquire of a worker slot. If successful, we assign that worker to the item
-    and signal the item’s event, so the original request can proceed.
+    Tries to dispatch items in PENDING_QUEUE if any worker is free,
+    preserving strict FIFO.
     """
     while True:
-        try:
-            request_item = PENDING_QUEUE.get_nowait()
-        except asyncio.QueueEmpty:
-            break
-
         async with enqueue_lock:
+            # If the queue is empty, we're done
+            if PENDING_QUEUE.empty():
+                break
+
+            # Take the front item (FIFO)
+            request_item = await PENDING_QUEUE.get()
+
+            # Attempt immediate worker acquisition
             worker_index = await try_acquire_worker()
             if worker_index is not None:
+                # Assign the worker to this item and signal
                 request_item["worker_index"] = worker_index
                 request_item["event"].set()
             else:
-                # Put it back and stop if none was free
-                await PENDING_QUEUE.put(request_item)
+                # No worker was free right now => put the item back
+                # at the front of the queue and stop trying
+                await PENDING_QUEUE.put_front(request_item)
                 break
 
 
