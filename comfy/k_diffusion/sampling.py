@@ -219,6 +219,82 @@ def sample_euler_ancestral_RF(model, x, sigmas, extra_args=None, callback=None, 
             if eta > 0:
                 x = (alpha_ip1 / alpha_down) * x + noise_sampler(sigmas[i], sigmas[i + 1]) * s_noise * renoise_coeff
     return x
+@torch.no_grad()
+def sample_euler_ancestral_multipass(
+    model,
+    x,
+    sigmas,
+    extra_args=None,
+    callback=None,
+    disable=None,
+    eta=1.0,
+    s_noise=1.0,
+    noise_sampler=None,
+    pass_steps=2,
+    pass_sigma_max=float("inf"),
+    pass_sigma_min=12.0
+):
+    """
+    A multipass variant of Euler-Ancestral sampling.
+
+    - For each i in [0, len(sigmas)-2], we check if sigma_i is in [pass_sigma_min, pass_sigma_max].
+      If so, subdivide the step from sigma_i -> sigma_{i+1} into 'pass_steps' sub-steps.
+      Otherwise, do a single standard step.
+    - Each sub-step calls 'get_ancestral_step(...)' with the sub-interval's start & end sigmas,
+      then applies the usual Euler-Ancestral update:
+         x = x + d*dt + (noise * sigma_up)
+    """
+    if extra_args is None:
+        extra_args = {}
+
+    seed = extra_args.get("seed", None)
+    noise_sampler = default_noise_sampler(x, seed=seed) if noise_sampler is None else noise_sampler
+
+    s_in = x.new_ones([x.shape[0]])
+    print(sigmas)
+    for i in trange(len(sigmas) - 1, disable=disable):
+        sigma_i = sigmas[i]
+        sigma_ip1 = sigmas[i + 1]
+
+        # Decide how many sub-steps to do
+        if pass_sigma_min <= sigma_i <= pass_sigma_max:
+            n_sub = pass_steps
+        else:
+            n_sub = 1
+        sub_sigmas = torch.linspace(sigma_i, sigma_ip1, n_sub + 1, device=sigmas.device)
+
+        for sub_step in range(n_sub):
+            # Current sub-step range:
+            sub_sigma_curr = sub_sigmas[sub_step]
+            sub_sigma_next = sub_sigmas[sub_step + 1]
+
+            # Denoise at the current sub-sigma
+            denoised = model(x, sub_sigma_curr * s_in, **extra_args)
+
+            if callback is not None:
+                callback({
+                    'x': x,
+                    'i': i,
+                    'sub_step': sub_step,
+                    'sigma': sub_sigma_curr,
+                    'denoised': denoised
+                })
+
+            # Compute the ancestral step parameters for this sub-interval
+            sigma_down, sigma_up = get_ancestral_step(sub_sigma_curr, sub_sigma_next, eta=eta)
+            if sigma_down == 0.0:
+                # If we're stepping down to 0, we typically just take the final denoised
+                x = denoised
+            else:
+                # Normal Euler-Ancestral logic
+                d = to_d(x, sub_sigma_curr, denoised)
+                dt = sigma_down - sub_sigma_curr
+                x = x + d * dt
+                if sigma_up != 0.0:
+                    # Add noise for the "ancestral" part
+                    x = x + noise_sampler(sub_sigma_curr, sub_sigma_next) * (s_noise * sigma_up)
+
+    return x
 
 @torch.no_grad()
 def sample_heun(model, x, sigmas, extra_args=None, callback=None, disable=None, s_churn=0., s_tmin=0., s_tmax=float('inf'), s_noise=1.):
